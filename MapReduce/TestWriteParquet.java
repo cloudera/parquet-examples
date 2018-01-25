@@ -17,8 +17,6 @@
  */
 package com.cloudera.parquet.hadoop;
 
-import static org.apache.parquet.format.converter.ParquetMetadataConverter.SKIP_ROW_GROUPS;
-
 import java.io.IOException;
 
 import org.apache.hadoop.conf.Configuration;
@@ -29,83 +27,94 @@ import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 import org.apache.parquet.example.data.Group;
-import org.apache.parquet.hadoop.ParquetFileReader;
-import org.apache.parquet.hadoop.example.ExampleInputFormat;
+import org.apache.parquet.example.data.GroupFactory;
+import org.apache.parquet.example.data.simple.SimpleGroupFactory;
 import org.apache.parquet.hadoop.example.ExampleOutputFormat;
 import org.apache.parquet.hadoop.example.GroupWriteSupport;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
-import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.MessageTypeParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * An example MR job implementation which reads data from a parquet file and
- * writes the same data in parquet with the specified compression codec.
+ * An example MR job implementation which reads data from a csv file and writes
+ * the first 2 columns to a parquet file.
  */
-public class TestReadWriteParquet extends Configured implements Tool {
-  private static final Logger LOG = LoggerFactory.getLogger(TestReadWriteParquet.class);
+public class TestWriteParquet extends Configured implements Tool {
+  private static final Logger LOG = LoggerFactory.getLogger(TestWriteParquet.class);
 
   /*
-   * Read a Parquet record, write a Parquet record
+   * Read a csv record, write a Parquet record
    */
-  public static class ReadRequestMap extends Mapper<LongWritable, Group, Void, Group> {
+  public static class ReadRequestMap extends Mapper<LongWritable, Text, Void, Group> {
+    private GroupFactory factory;
+
     @Override
-    public void map(LongWritable key, Group value, Context context) throws IOException, InterruptedException {
-      context.write(null, value);
+    public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+      String[] record = value.toString().split(",");
+
+      if (factory == null) {
+        factory = new SimpleGroupFactory(GroupWriteSupport.getSchema(context.getConfiguration()));
+      }
+
+      Group group = factory.newGroup();
+      group.append("x", record[0]);
+      group.append("y", record[1]);
+
+      context.write(null, group);
     }
   }
 
   public int run(String[] args) throws Exception {
     if (args.length < 2) {
-      LOG.error("Usage: {} INPUTFILE OUTPUTFILE [compression]", getClass().getName());
+      LOG.error("Usage: {} INPUTFILE OUTPUTFILE", getClass().getName());
       return 1;
     }
     String inputFile = args[0];
     String outputFile = args[1];
-    String compression = (args.length > 2) ? args[2] : "none";
 
-    Path parquetFilePath = null;
+    Path csvFilePath = null;
     // Find a file in case a directory was passed
     RemoteIterator<LocatedFileStatus> it = FileSystem.get(getConf()).listFiles(new Path(inputFile), true);
     while (it.hasNext()) {
       FileStatus fs = it.next();
       if (fs.isFile()) {
-        parquetFilePath = fs.getPath();
+        csvFilePath = fs.getPath();
         break;
       }
     }
-    if (parquetFilePath == null) {
+    if (csvFilePath == null) {
       LOG.error("No file found for {}", inputFile);
       return 1;
     }
-    LOG.info("Getting schema from {}", parquetFilePath);
-    ParquetMetadata footer = ParquetFileReader.readFooter(getConf(), parquetFilePath, SKIP_ROW_GROUPS);
-    MessageType schema = footer.getFileMetaData().getSchema();
-    LOG.info("Retrieved schema: {}", schema);
-    GroupWriteSupport.setSchema(schema, getConf());
 
     Job job = Job.getInstance(getConf());
     job.setJarByClass(getClass());
     job.setJobName(getClass().getName());
     job.setMapperClass(ReadRequestMap.class);
     job.setNumReduceTasks(0);
-    job.setInputFormatClass(ExampleInputFormat.class);
+    job.setInputFormatClass(TextInputFormat.class);
     job.setOutputFormatClass(ExampleOutputFormat.class);
 
-    CompressionCodecName codec = CompressionCodecName.UNCOMPRESSED;
-    if (compression.equalsIgnoreCase("snappy")) {
-      codec = CompressionCodecName.SNAPPY;
-    } else if (compression.equalsIgnoreCase("gzip")) {
-      codec = CompressionCodecName.GZIP;
-    }
+    MessageType schema = MessageTypeParser
+        .parseMessageType("message example {"
+            + "required binary x (UTF8);"
+            + "required binary y (UTF8);"
+            + "}");
+    LOG.info("Setting output parquet schema: {}", schema);
+    ExampleOutputFormat.setSchema(job, schema);
+
+    CompressionCodecName codec = CompressionCodecName.SNAPPY;
     LOG.info("Output compression: {}", codec);
     ExampleOutputFormat.setCompression(job, codec);
 
@@ -119,7 +128,7 @@ public class TestReadWriteParquet extends Configured implements Tool {
 
   public static void main(String[] args) throws Exception {
     try {
-      int res = ToolRunner.run(new Configuration(), new TestReadWriteParquet(), args);
+      int res = ToolRunner.run(new Configuration(), new TestWriteParquet(), args);
       System.exit(res);
     } catch (Exception e) {
       e.printStackTrace();
